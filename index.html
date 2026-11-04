@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ONA FactCheck</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- ===================== 상단 (헤더) ===================== -->
+  <header class="site-header">
+    <div class="container header-inner">
+      <div class="brand">
+        <div class="logo-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="32" height="32">
+            <circle cx="14" cy="14" r="9" fill="none" stroke="currentColor" stroke-width="3"/>
+            <path d="M10 14.5l3 3 5.5-6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M21 21l7 7" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="logo-text">ONA <span>FactCheck</span></h1>
+          <p class="tagline">AI 기반 팩트체크 시스템</p>
+        </div>
+      </div>
+      <span id="serverStatus" class="server-status">서버 확인 중…</span>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- ===================== 중앙 (입력) ===================== -->
+    <section class="input-card" aria-labelledby="inputTitle">
+      <h2 id="inputTitle" class="section-title">검증할 주장</h2>
+      <p class="help-text">기사에 들어간 문장, 주장, 수치를 그대로 붙여 넣으세요. 한 번에 한 가지 주장을 넣을 때 가장 정확합니다.</p>
+
+      <textarea id="claimInput" rows="5" maxlength="3000"
+        placeholder="예) 2023년 한국의 합계출산율은 0.72명으로 OECD 회원국 중 가장 낮았다."></textarea>
+
+      <div class="input-footer">
+        <span id="charCount" class="char-count">0 / 3000</span>
+        <div class="input-actions">
+          <button type="button" id="sampleBtn" class="btn-secondary">예시 화면 보기</button>
+          <button type="button" id="checkBtn" class="btn-primary">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" d="M10.5 17a6.5 6.5 0 1 1 0-13 6.5 6.5 0 0 1 0 13zM15.5 15.5 20 20"/></svg>
+            팩트체크 실행
+          </button>
+        </div>
+      </div>
+      <p id="serverNotice" class="key-notice" hidden></p>
+    </section>
+
+    <!-- 진행 중 표시 -->
+    <section id="loading" class="loading-card" hidden aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <p class="loading-title">팩트체크 진행 중입니다</p>
+        <p id="loadingStep" class="loading-step">검색을 준비하고 있습니다…</p>
+        <p class="loading-hint">보통 20초~1분 정도 걸립니다.</p>
+      </div>
+    </section>
+
+    <!-- 오류 표시 -->
+    <section id="errorBox" class="error-card" hidden role="alert"></section>
+
+    <!-- ===================== 결과 ===================== -->
+    <section id="results" class="results" hidden aria-live="polite">
+
+      <div id="sampleBanner" class="sample-banner" hidden>
+        예시 화면입니다. 실제 검증 결과가 아니며, 출처 주소도 가짜(example.com)입니다.
+      </div>
+
+      <!-- 1. 판정 결과 -->
+      <article class="result-card verdict-card">
+        <div class="card-head">
+          <h2 class="section-title">판정 결과</h2>
+          <button type="button" id="copyBtn" class="btn-ghost small">결과 복사</button>
+        </div>
+        <div class="verdict-row">
+          <span id="verdictBadge" class="verdict-badge"></span>
+          <span id="checkedAt" class="confidence"></span>
+        </div>
+        <blockquote id="claimEcho" class="claim-echo"></blockquote>
+        <p id="verdictSummary" class="verdict-summary"></p>
+
+        <dl id="criteria" class="criteria"></dl>
+
+        <div id="adjustBox" class="adjust-box" hidden>
+          <strong>자동 점검 안내</strong>
+          <ul id="adjustList"></ul>
+        </div>
+      </article>
+
+      <!-- 2. 판정 이유 -->
+      <article class="result-card">
+        <h2 class="section-title">판정 이유</h2>
+        <div id="reasoning" class="reasoning"></div>
+        <div id="conflictBox" class="conflict-box" hidden>
+          <h3 class="sub-title">자료 간 충돌</h3>
+          <ul id="conflictList"></ul>
+        </div>
+      </article>
+
+      <!-- 3. 핵심 근거 -->
+      <article class="result-card">
+        <h2 class="section-title">핵심 근거 <span id="evidenceCount" class="count-pill"></span></h2>
+        <p class="help-text">AI가 인용한 문장이 실제 원문에 있는지 직접 확인하세요. <strong>원문에서 해당 문장 보기</strong>를 누르면 출처 페이지의 그 위치로 이동합니다(Chrome·Edge·Safari).</p>
+        <ol id="evidenceList" class="evidence-list"></ol>
+      </article>
+
+      <!-- 4. 수정 제안 -->
+      <article class="result-card">
+        <h2 class="section-title">수정 제안</h2>
+        <div id="compareWrap" class="compare">
+          <div class="compare-col">
+            <h3 class="compare-label">원문</h3>
+            <p id="originalText" class="compare-text original"></p>
+          </div>
+          <div class="compare-col">
+            <h3 class="compare-label suggest">수정 제안</h3>
+            <p id="suggestionText" class="compare-text suggestion"></p>
+          </div>
+        </div>
+        <p id="suggestionNote" class="suggestion-note"></p>
+      </article>
+
+      <p class="disclaimer">
+        ※ AI 판정은 취재를 돕는 참고 자료입니다. 출처 원문을 직접 확인하고, 최종 판단은 기자와 데스크가 내려 주세요.
+      </p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">ONA FactCheck · 뉴스룸 내부용 · 검색 Tavily · 분석 Google Gemini</div>
+  </footer>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

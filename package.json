@@ -1,0 +1,14 @@
+{
+  "name": "ona-factcheck",
+  "version": "1.0.0",
+  "description": "ONA FactCheck - AI 기반 팩트체크 시스템 (로컬 실행용)",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

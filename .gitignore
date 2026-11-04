@@ -1,0 +1,24 @@
+# 실제 API 키 파일 - 절대 GitHub에 올리지 않음
+.env
+.env.*
+!.env.example
+*.env
+
+# 인증서·비밀키 파일
+*.pem
+*.key
+*.p12
+*.crt
+credentials*.json
+service-account*.json
+
+# 자동 생성 파일
+node_modules/
+npm-debug.log*
+*.log
+
+# 개인 환경 파일
+.DS_Store
+.claude/
+.vscode/
+.idea/
