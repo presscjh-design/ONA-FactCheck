@@ -2,20 +2,27 @@
    ONA FactCheck 서버
    ---------------------------------------------------------
    - API 키는 .env 파일에서만 읽고, 브라우저로는 절대 보내지 않습니다.
-   - 이 컴퓨터(localhost)에서만 접속할 수 있습니다.
+   - 내 컴퓨터에서 실행하면 localhost에서만 접속할 수 있습니다.
+   - Render 같은 호스팅에서 실행하면(RENDER 환경변수 자동 감지) 외부 접속을 받되,
+     ACCESS_PASSWORD 인증과 요청 횟수 제한이 반드시 적용됩니다.
    - 실행: 터미널에서 npm start → 브라우저에서 http://localhost:3000
    ========================================================= */
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { runFactCheck, ServiceError } from "./factcheck.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnvFile(path.join(ROOT, ".env"));
 
-const HOST = "127.0.0.1";                       // 이 컴퓨터에서만 접속 가능 (바꾸지 마세요)
+// 호스팅 여부: Render가 자동으로 넣는 RENDER 변수, 또는 직접 HOSTED=1 로 지정
+const HOSTED = Boolean(process.env.RENDER) || process.env.HOSTED === "1";
+// 내 컴퓨터: 127.0.0.1(이 컴퓨터에서만 접속) / 호스팅: 0.0.0.0(외부 접속 허용)
+const HOST = HOSTED ? "0.0.0.0" : "127.0.0.1";
 const PORT = Number(process.env.PORT) || 3000;
+const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || "";
 const KEYS = {
   tavilyKey: (process.env.TAVILY_API_KEY || "").trim(),
   geminiKey: (process.env.GEMINI_API_KEY || "").trim(),
@@ -32,6 +39,67 @@ const PUBLIC_FILES = {
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
 };
 const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
+if (HOSTED) {
+  // 배포 주소(예: ona-factcheck.onrender.com)만 허용. 직접 정하려면 ALLOWED_HOSTS 환경변수(쉼표 구분)
+  for (const h of [process.env.RENDER_EXTERNAL_HOSTNAME, ...(process.env.ALLOWED_HOSTS || "").split(",")]) {
+    if (h && h.trim()) ALLOWED_HOSTS.add(h.trim().toLowerCase());
+  }
+}
+
+// ---- 요청 횟수 제한 (사람마다 / 서버 전체) ----
+const RATE_WINDOW_MS = 10 * 60 * 1000;                               // 10분
+const RATE_MAX_PER_IP = Number(process.env.RATE_LIMIT_PER_10MIN) || 10; // 한 사람당 10분에 10건
+const DAILY_MAX_TOTAL = Number(process.env.DAILY_LIMIT) || 200;        // 서버 전체 하루 200건 (API 요금 보호)
+const AUTH_FAIL_MAX = 10;                                            // 비밀번호 10번 틀리면 15분 차단
+const AUTH_BLOCK_MS = 15 * 60 * 1000;
+const hits = new Map();       // ip -> 요청 시각 목록
+const authFails = new Map();  // ip -> { count, until }
+let daily = { day: "", count: 0 };
+
+function clientIp(req) {
+  // Render는 Cloudflare를 거치므로 Cloudflare가 직접 확인해 넣는 CF-Connecting-IP를 우선 사용
+  // (X-Forwarded-For의 마지막 값은 Render에서는 사용자가 아니라 Cloudflare 중계 서버 주소일 수 있음)
+  if (process.env.RENDER) {
+    const cf = String(req.headers["cf-connecting-ip"] || "").trim();
+    if (cf) return cf;
+  }
+  // 그 밖의 호스팅: 프록시가 붙여 주는 X-Forwarded-For의 마지막 값(프록시가 직접 확인한 주소)을 사용
+  if (HOSTED) {
+    const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((v) => v.trim()).filter(Boolean);
+    if (xff.length) return xff[xff.length - 1];
+  }
+  return req.socket.remoteAddress || "unknown";
+}
+function rateLimited(ip) {
+  const now = Date.now();
+  const list = (hits.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (list.length >= RATE_MAX_PER_IP) { hits.set(ip, list); return Math.ceil((RATE_WINDOW_MS - (now - list[0])) / 1000); }
+  list.push(now); hits.set(ip, list);
+  return 0;
+}
+function dailyLimited() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (daily.day !== day) daily = { day, count: 0 };
+  if (daily.count >= DAILY_MAX_TOTAL) return true;
+  daily.count++;
+  return false;
+}
+setInterval(() => {   // 메모리 정리
+  const now = Date.now();
+  for (const [ip, list] of hits) if (!list.some((t) => now - t < RATE_WINDOW_MS)) hits.delete(ip);
+  for (const [ip, f] of authFails) if (f.until && now > f.until) authFails.delete(ip);
+}, 5 * 60 * 1000).unref();
+
+// ---- 접속 비밀번호 (HTTP Basic 인증: 브라우저가 아이디/비밀번호 창을 띄웁니다. 아이디는 아무거나, 비밀번호만 맞으면 됨) ----
+const sha = (v) => crypto.createHash("sha256").update(String(v)).digest();
+function authorized(req) {
+  if (!ACCESS_PASSWORD) return true;   // 비밀번호 미설정(내 컴퓨터 로컬 실행)이면 인증 생략
+  const m = String(req.headers.authorization || "").match(/^Basic\s+(.+)$/i);
+  if (!m) return false;
+  const decoded = Buffer.from(m[1], "base64").toString("utf8");
+  const pw = decoded.slice(decoded.indexOf(":") + 1);
+  return crypto.timingSafeEqual(sha(pw), sha(ACCESS_PASSWORD));
+}
 const MAX_CLAIM = 3000;
 const MAX_RUNNING = 2;   // 동시에 처리할 팩트체크 수
 let running = 0;
@@ -42,14 +110,45 @@ const SECURITY_HEADERS = {
   "Referrer-Policy": "no-referrer",
   "X-Frame-Options": "DENY",
   "Cache-Control": "no-store",
+  ...(HOSTED ? { "Strict-Transport-Security": "max-age=31536000" } : {}),
 };
 
 const server = http.createServer(async (req, res) => {
+  // 주소가 잘못된 요청(예: //)에 서버가 멈추지 않도록 여기서 걸러냄
+  let url;
+  try {
+    url = new URL(req.url, `http://localhost:${PORT}`);
+  } catch {
+    return send(res, 400, "text/plain; charset=utf-8", "Bad request");
+  }
+
+  // 호스팅의 상태 확인용 (비밀 정보 없음)
+  if (url.pathname === "/healthz" && req.method === "GET") {
+    return send(res, 200, "text/plain; charset=utf-8", "ok");
+  }
+
   // 다른 사이트가 이 서버를 몰래 부르는 것을 막기 위한 주소 확인
   if (!ALLOWED_HOSTS.has(String(req.headers.host || "").toLowerCase())) {
     return send(res, 403, "text/plain; charset=utf-8", "Forbidden");
   }
-  const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // 접속 비밀번호 확인 (틀린 시도가 반복되면 잠시 차단)
+  if (ACCESS_PASSWORD) {
+    const ip = clientIp(req);
+    const f = authFails.get(ip);
+    if (f && f.until && Date.now() < f.until) {
+      return send(res, 429, "text/plain; charset=utf-8", "시도 횟수를 초과했습니다. 잠시 후 다시 시도해 주세요.");
+    }
+    if (!authorized(req)) {
+      const cur = f && (!f.until || Date.now() >= f.until) ? f : { count: 0, until: 0 };
+      cur.count++;
+      if (cur.count >= AUTH_FAIL_MAX) { cur.until = Date.now() + AUTH_BLOCK_MS; cur.count = 0; }
+      authFails.set(ip, cur);
+      res.writeHead(401, { ...SECURITY_HEADERS, "Content-Type": "text/plain; charset=utf-8", "WWW-Authenticate": 'Basic realm="ONA FactCheck", charset="UTF-8"' });
+      return res.end("접속 비밀번호가 필요합니다.");
+    }
+    authFails.delete(ip);
+  }
 
   if (req.method === "GET" && PUBLIC_FILES[url.pathname]) {
     const { file, type } = PUBLIC_FILES[url.pathname];
@@ -99,6 +198,11 @@ async function handleFactCheck(req, res) {
   }
   if (running >= MAX_RUNNING) {
     return sendJson(res, 429, { error: "다른 팩트체크가 진행 중입니다.", hint: "잠시 후 다시 실행해 주세요." });
+  }
+  if (HOSTED) {   // 호스팅에서만 횟수 제한 적용 (내 컴퓨터에서는 제한 없음)
+    const wait = rateLimited(clientIp(req));
+    if (wait) return sendJson(res, 429, { error: "요청이 너무 잦습니다.", hint: `약 ${Math.ceil(wait / 60)}분 뒤에 다시 시도해 주세요. (10분에 ${RATE_MAX_PER_IP}건까지)` });
+    if (dailyLimited()) return sendJson(res, 429, { error: "오늘 사용 한도에 도달했습니다.", hint: "내일 다시 시도해 주세요." });
   }
 
   // 진행 상황을 한 줄씩 보내는 방식 (NDJSON)
@@ -195,13 +299,23 @@ server.on("error", (err) => {
   process.exit(1);
 });
 
+// 호스팅인데 비밀번호가 없으면 아무나 API 요금을 쓰게 되므로 시작하지 않음
+if (HOSTED && ACCESS_PASSWORD.length < 8) {
+  console.error("\n[오류] 호스팅 환경에서는 ACCESS_PASSWORD(8자 이상) 환경변수가 꼭 필요합니다. 서버를 시작하지 않습니다.\n");
+  process.exit(1);
+}
+
 server.listen(PORT, HOST, () => {
   console.log("\n==============================================");
   console.log("  ONA FactCheck 서버가 켜졌습니다.");
-  console.log(`  브라우저에서 접속:  http://localhost:${PORT}`);
+  console.log(HOSTED ? `  호스팅 모드 (포트 ${PORT}, 접속 비밀번호·횟수 제한 적용)` : `  브라우저에서 접속:  http://localhost:${PORT}`);
   console.log("  끄려면 이 창에서 Ctrl + C 를 누르세요.");
   console.log("==============================================");
   console.log(`  Tavily 키: ${KEYS.tavilyKey ? "설정됨 ✓" : "없음 ✗ (.env 확인)"}`);
   console.log(`  Gemini 키: ${KEYS.geminiKey ? "설정됨 ✓" : "없음 ✗ (.env 확인)"}`);
   console.log(`  Gemini 모델: ${KEYS.geminiModel}\n`);
+  if (HOSTED) {
+    console.log("  [주의] 하루 요청 수는 메모리에만 기록되어 서버가 재시작되면 0으로 돌아갑니다.");
+    console.log("         요금 상한은 Tavily·Gemini 계정 쪽에서 따로 관리하세요. (README 참고)\n");
+  }
 });

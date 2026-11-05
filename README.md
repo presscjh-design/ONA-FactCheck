@@ -177,3 +177,19 @@ npm start
 - Node.js 내장 기능만 사용 (외부 패키지 없음)
 - [Tavily Search API](https://docs.tavily.com) — 웹 검색
 - [Google Gemini API](https://aistudio.google.com) — 판정 분석
+
+
+---
+
+## Render 등 인터넷 호스팅에 배포할 때
+
+서버가 `RENDER` 환경변수를 감지하면 자동으로 호스팅 모드가 됩니다. (다른 호스팅은 `HOSTED=1`)
+
+- 외부 접속 허용(0.0.0.0), 배포 주소(`RENDER_EXTERNAL_HOSTNAME`)만 허용
+- `ACCESS_PASSWORD`(8자 이상) 필수 — 없으면 서버가 시작되지 않습니다. 접속 시 브라우저가 비밀번호 창을 띄웁니다(아이디는 아무거나).
+- 요청 제한: 한 사람당 10분에 10건, 서버 전체 하루 200건 (`RATE_LIMIT_PER_10MIN`, `DAILY_LIMIT`으로 조정)
+- ⚠️ 이 횟수는 메모리에만 기록되어 서버가 재시작되면 0으로 돌아갑니다. Render 무료 서비스는 15분간 접속이 없으면 잠들었다가 다시 켜지므로 하루 200건은 **요금 상한이 아닙니다.** 요금 상한은 Tavily·Gemini 계정 쪽에서 관리하세요. (결제 수단을 연결하지 않은 무료 등급 키 사용, 또는 각 서비스의 사용량 한도 설정)
+- 환경변수(호스팅 화면에서 입력): `TAVILY_API_KEY`, `GEMINI_API_KEY`, `ACCESS_PASSWORD`
+- Build Command: `npm install` / Start Command: `npm start` (의존 패키지는 없습니다)
+
+내 컴퓨터에서 `npm start`로 실행할 때는 기존과 똑같이 localhost에서만 접속되며 비밀번호·횟수 제한이 없습니다.
