@@ -154,6 +154,7 @@ function renderResult(r, isSample) {
     : "";
   const rows = [
     ["주제 분류", si.topicLabel], ["검색 범위", searchText],
+    ["지정한 범위", (si.scope?.applied || []).join(" · ")],
     ["주장의 기준 시점", c.timeframe], ["주장의 지역", c.region], ["주장의 대상", c.subject],
   ].filter(([, val]) => val);
   els.criteria.innerHTML = rows.map(([k, val]) => `<dt>${k}</dt><dd>${esc(val)}</dd>`).join("");

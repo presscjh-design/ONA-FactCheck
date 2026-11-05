@@ -67,6 +67,18 @@ export const NEWS_DOMAINS = [
   "washingtonpost.com", "ft.com", "bloomberg.com", "wsj.com", "theguardian.com",
 ];
 
+// 지역 언론 목록 (챗봇에서 '대구·경북 언론으로'처럼 지정했을 때만 사용. 지정하지 않으면 쓰지 않습니다)
+// 다른 지역을 넣으려면 같은 형식으로 한 줄 추가하세요.
+export const REGIONAL_PRESS = {
+  "대구·경북": {
+    "imaeil.com": "매일신문", "yeongnam.com": "영남일보", "kyongbuk.co.kr": "경북일보",
+    "kbmaeil.com": "경북매일", "idaegu.com": "대구일보", "idaegu.co.kr": "대구신문",
+    "hidomin.com": "경북도민일보", "dkilbo.com": "대경일보", "kbsm.net": "경북신문",
+    "tbc.co.kr": "TBC", "dgmbc.com": "대구MBC", "andongmbc.co.kr": "안동MBC",
+    "phmbc.co.kr": "포항MBC", "newsmin.co.kr": "뉴스민", "pn.or.kr": "평화뉴스",
+  },
+};
+
 export const PUBLISHER_NAMES = {
   "kostat.go.kr": "통계청", "mods.go.kr": "국가데이터처", "kosis.kr": "국가통계포털(KOSIS)",
   "korea.kr": "대한민국 정책브리핑", "data.go.kr": "공공데이터포털", "law.go.kr": "국가법령정보센터",
@@ -113,6 +125,12 @@ const PRIMARY_SEARCH_DOMAINS = [
   "go.kr", "korea.kr", "kosis.kr", "bok.or.kr", "kdi.re.kr",
   "oecd.org", "un.org", "who.int", "worldbank.org", "imf.org", "europa.eu",
 ];
+
+// '정부 자료로만', '공식 통계로만' 범위 검색에 쓰는 사이트 목록
+const SCOPE_OFFICIAL_DOMAINS = [
+  "go.kr", "korea.kr", "kosis.kr", "bok.or.kr", "re.kr", "nhis.or.kr", "hira.or.kr", "nps.or.kr", "kotra.or.kr",
+];
+const SCOPE_STATS_DOMAINS = ["oecd.org", "un.org", "who.int", "worldbank.org", "imf.org", "europa.eu"];
 
 export const TIERS = {
   primary:   { rank: 1, label: "1차 자료" },
@@ -243,16 +261,21 @@ const RESPONSE_SCHEMA = {
  * @param {string} claim  검증할 주장
  * @param {{tavilyKey:string, geminiKey:string, geminiModel:string}} keys
  * @param {(step:string)=>void} onProgress  진행 상황 알림
+ * @param {{scope?:object}} options  챗봇에서 지정한 검색 범위 (없으면 기존과 똑같이 검색)
  */
-export async function runFactCheck(claim, keys, onProgress = () => {}) {
+export async function runFactCheck(claim, keys, onProgress = () => {}, options = {}) {
   const checkedAt = todayKST();
 
   onProgress("주장의 주제와 관련 국가를 파악하고 검색어를 정하고 있습니다…");
   const plan = await planSearch(claim, keys);
 
   const langText = plan.queries.filter((q) => q.lang_code !== "ko").map((q) => q.lang_label).join("·");
-  onProgress(`정부·관계기관 공식 자료를 우선 검색하고 있습니다…${langText ? ` (한국어·${langText})` : ""}`);
-  const { sources, searchInfo } = await searchEvidence(claim, plan, keys.tavilyKey, onProgress);
+  onProgress(options.scope
+    ? "지정한 범위 안에서 자료를 검색하고 있습니다…"
+    : `정부·관계기관 공식 자료를 우선 검색하고 있습니다…${langText ? ` (한국어·${langText})` : ""}`);
+  const { sources, searchInfo } = options.scope
+    ? await searchScoped(claim, plan, keys.tavilyKey, options.scope)
+    : await searchEvidence(claim, plan, keys.tavilyKey, onProgress);
 
   if (sources.length === 0) {
     return {
@@ -375,8 +398,25 @@ async function searchEvidence(claim, plan, apiKey, onProgress) {
     all = all.concat(await gather(round2, true));
   }
 
-  // 정리: 중복 제거 → 관련도 낮은 자료 제외 → 신뢰도 등급 순, 같은 등급은 관련도 순 → 한 사이트당 최대 2건
-  const candidates = uniqueByUrl(all)
+  const sources = pickSources(toCandidates(all));
+
+  return {
+    sources,
+    searchInfo: {
+      topic: plan.topic,
+      topicLabel: TOPICS[plan.topic],
+      languages: ["한국어", ...foreign.map((q) => q.lang_label || q.lang_code)],
+      queries: plan.queries.map((q) => q.text),
+      officialFound: sources.filter((s) => ["primary", "public"].includes(s.tier)).length,
+      referenceShown: sources.filter((s) => s.tier === "reference").length,
+      supplemented,
+    },
+  };
+}
+
+// 정리: 중복 제거 → 관련도 낮은 자료 제외 → 신뢰도 등급 순, 같은 등급은 관련도 순
+function toCandidates(all) {
+  return uniqueByUrl(all)
     .filter((r) => (r.score ?? 1) >= SETTINGS.minRelevance && (r.content || "").trim())
     .map((r) => {
       const host = hostnameOf(r.url);
@@ -392,7 +432,9 @@ async function searchEvidence(claim, plan, apiKey, onProgress) {
       };
     })
     .sort((a, b) => TIERS[a.tier].rank - TIERS[b.tier].rank || b.score - a.score);
-
+}
+// 한 사이트당 최대 2건, 전체 최대 5건을 고르고 번호 붙이기
+function pickSources(candidates) {
   const perHost = new Map();
   const picked = [];
   for (const c of candidates) {
@@ -402,18 +444,99 @@ async function searchEvidence(claim, plan, apiKey, onProgress) {
     picked.push(c);
     if (picked.length >= SETTINGS.maxEvidence) break;
   }
-  const sources = picked.map((s, i) => ({ ...s, id: i + 1 }));
+  return picked.map((s, i) => ({ ...s, id: i + 1 }));
+}
+
+// ---------------- 1-2. 챗봇에서 지정한 범위 안에서만 검색 ----------------
+// scope = { source: "GOV"|"STATS"|"NEWS"|"REGIONAL"|"", recencyDays: 숫자, region: "대구·경북", notes: [안내문] }
+// 범위를 벗어나는 보완 검색은 하지 않고, 검색 뒤에 프로그램이 한 번 더 걸러 냅니다.
+async function searchScoped(claim, plan, apiKey, scope) {
+  const claimQuery = claim.replace(/\s+/g, " ").trim().slice(0, 380);
+  const koPlan = plan.queries.find((q) => q.lang_code === "ko");
+  const foreign = plan.queries.filter((q) => q.lang_code !== "ko");
+  const base = {
+    search_depth: "advanced", chunks_per_source: 3, max_results: SETTINGS.searchResultsEach,
+    include_published_date: true, include_answer: false, include_raw_content: false, topic: "general",
+  };
+  const applied = [];
+  const limitations = [...(scope.notes || [])];
+  let keep = (c) => c.tier !== "reference";
+  let decorate = (c) => c;
+  let texts = [claimQuery, koPlan?.text].filter(Boolean);
+
+  if (scope.source === "GOV" || scope.source === "STATS") {
+    const planned = plan.officialDomains.filter((d) => ["primary", "public"].includes(classifyTier(d)));
+    const domains = [...new Set([
+      ...SCOPE_OFFICIAL_DOMAINS,
+      ...(scope.source === "STATS" ? SCOPE_STATS_DOMAINS : []),
+      ...plan.countries.flatMap((c) => COUNTRY_OFFICIAL_DOMAINS[c] || []),
+      ...planned,
+    ])];
+    base.include_domains = domains;
+    texts = [...texts, ...foreign.map((q) => q.text)];
+    keep = (c) => domains.some((d) => matchesDomain(c.host, d));
+    if (scope.source === "GOV") applied.push("정부·공공기관 공식 사이트로 제한");
+    else {
+      applied.push("공공기관·공식 통계 사이트로 제한");
+      limitations.push("사이트 주소로만 제한합니다. 공공기관 사이트의 통계가 아닌 글이 포함될 수 있습니다.");
+    }
+  } else if (scope.source === "NEWS") {
+    base.topic = "news";
+    base.exclude_domains = REFERENCE_DOMAINS;
+    keep = (c) => ["news", "other"].includes(c.tier);
+    applied.push("언론 기사로 제한 (Tavily 뉴스 검색)");
+    limitations.push("기사 여부는 Tavily의 뉴스 분류를 따르며, 모든 결과가 기사임을 보장하지는 않습니다.");
+  } else if (scope.source === "REGIONAL") {
+    const press = REGIONAL_PRESS[scope.region];
+    if (press) {
+      const domains = Object.keys(press);
+      base.include_domains = domains;
+      keep = (c) => domains.some((d) => matchesDomain(c.host, d));
+      decorate = (c) => {
+        const d = domains.find((x) => matchesDomain(c.host, x));
+        return d ? { ...c, tier: "news", knownPublisher: c.knownPublisher || press[d] } : c;
+      };
+      applied.push(`${scope.region} 지역 언론 ${domains.length}곳으로 제한`);
+      limitations.push("등록된 언론사 목록 안에서만 찾습니다. 목록에 없는 지역 언론은 포함되지 않습니다.");
+    } else {
+      base.topic = "news";
+      base.exclude_domains = REFERENCE_DOMAINS;
+      keep = (c) => ["news", "other"].includes(c.tier);
+      texts = texts.map((q) => `${scope.region} ${q}`.slice(0, 380));
+      applied.push(`언론 기사 중 '${scope.region}' 검색어 추가`);
+      limitations.push(`'${scope.region}' 지역 언론 목록이 없어 그 지역 언론으로 정확히 제한하지 못했습니다. 전국 기사가 섞일 수 있습니다.`);
+    }
+  }
+
+  let oldest = "";
+  if (scope.recencyDays) {
+    oldest = shiftDate(todayKST(), -scope.recencyDays);
+    base.start_date = oldest;
+    applied.push(`${oldest} 이후 자료로 제한`);
+  }
+
+  const all = await gather([...new Set(texts)].slice(0, 4).map((q) => tavilySearch({ ...base, query: q }, apiKey)));
+  const candidates = toCandidates(all).map(decorate);
+  const inScope = candidates.filter(keep);
+  // 기간 지정: 게시일을 확인할 수 없는 자료는 기간 안이라고 볼 수 없어 제외
+  const dated = oldest ? inScope.filter((c) => c.publishedDate && c.publishedDate >= oldest) : inScope;
+  const dropped = candidates.length - dated.length;
+  if (oldest && inScope.length > dated.length) {
+    limitations.push(`게시일이 기간 밖이거나 확인되지 않는 자료 ${inScope.length - dated.length}건을 제외했습니다.`);
+  }
+  const sources = pickSources(dated);
 
   return {
     sources,
     searchInfo: {
       topic: plan.topic,
       topicLabel: TOPICS[plan.topic],
-      languages: ["한국어", ...foreign.map((q) => q.lang_label || q.lang_code)],
+      languages: ["한국어", ...(base.include_domains && scope.source !== "REGIONAL" ? foreign.map((q) => q.lang_label || q.lang_code) : [])],
       queries: plan.queries.map((q) => q.text),
       officialFound: sources.filter((s) => ["primary", "public"].includes(s.tier)).length,
       referenceShown: sources.filter((s) => s.tier === "reference").length,
-      supplemented,
+      supplemented: false,
+      scope: { applied, limitations, dropped },
     },
   };
 }
@@ -478,7 +601,7 @@ ${sourceText}
 }
 
 // Gemini에게 JSON 형식 답변을 받는 공통 함수
-async function generateJson(systemText, userText, schema, keys) {
+export async function generateJson(systemText, userText, schema, keys) {
   const body = {
     systemInstruction: { parts: [{ text: systemText }] },
     contents: [{ role: "user", parts: [{ text: userText }] }],
@@ -735,8 +858,14 @@ function formatDate(v) {
   if (isNaN(d)) return "";
   return d.toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" }); // YYYY-MM-DD
 }
-function todayKST() {
+export function todayKST() {
   return new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Seoul" });
+}
+// YYYY-MM-DD 날짜를 며칠 앞뒤로 옮기기
+export function shiftDate(day, delta) {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
 }
 function clean(s) {
   return String(s || "").replace(/\s+/g, " ").trim();

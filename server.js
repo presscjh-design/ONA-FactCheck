@@ -13,6 +13,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { runFactCheck, ServiceError } from "./factcheck.js";
+import { handleChatTurn, CHAT_LIMITS } from "./chat.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 loadEnvFile(path.join(ROOT, ".env"));
@@ -37,6 +38,8 @@ const PUBLIC_FILES = {
   "/index.html": { file: "index.html", type: "text/html; charset=utf-8" },
   "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
+  "/chatbot.js": { file: "chatbot.js", type: "text/javascript; charset=utf-8" },
+  "/chatbot.css": { file: "chatbot.css", type: "text/css; charset=utf-8" },
 };
 const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`]);
 if (HOSTED) {
@@ -50,11 +53,16 @@ if (HOSTED) {
 const RATE_WINDOW_MS = 10 * 60 * 1000;                               // 10분
 const RATE_MAX_PER_IP = Number(process.env.RATE_LIMIT_PER_10MIN) || 10; // 한 사람당 10분에 10건
 const DAILY_MAX_TOTAL = Number(process.env.DAILY_LIMIT) || 200;        // 서버 전체 하루 200건 (API 요금 보호)
+// 챗봇 일반 메시지(검색 없음)의 별도 제한. 챗봇이 실행하는 팩트체크는 위의 팩트체크 제한을 함께 씁니다.
+const CHAT_MAX_PER_IP = Number(process.env.CHAT_RATE_LIMIT_PER_10MIN) || 30;  // 한 사람당 10분에 30건
+const CHAT_DAILY_MAX = Number(process.env.CHAT_DAILY_LIMIT) || 600;            // 서버 전체 하루 600건
 const AUTH_FAIL_MAX = 10;                                            // 비밀번호 10번 틀리면 15분 차단
 const AUTH_BLOCK_MS = 15 * 60 * 1000;
 const hits = new Map();       // ip -> 요청 시각 목록
 const authFails = new Map();  // ip -> { count, until }
 let daily = { day: "", count: 0 };
+const chatHits = new Map();   // ip -> 챗봇 요청 시각 목록
+let chatDaily = { day: "", count: 0 };
 
 function clientIp(req) {
   // Render는 Cloudflare를 거치므로 Cloudflare가 직접 확인해 넣는 CF-Connecting-IP를 우선 사용
@@ -70,11 +78,11 @@ function clientIp(req) {
   }
   return req.socket.remoteAddress || "unknown";
 }
-function rateLimited(ip) {
+function rateLimited(ip, store = hits, max = RATE_MAX_PER_IP) {
   const now = Date.now();
-  const list = (hits.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
-  if (list.length >= RATE_MAX_PER_IP) { hits.set(ip, list); return Math.ceil((RATE_WINDOW_MS - (now - list[0])) / 1000); }
-  list.push(now); hits.set(ip, list);
+  const list = (store.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (list.length >= max) { store.set(ip, list); return Math.ceil((RATE_WINDOW_MS - (now - list[0])) / 1000); }
+  list.push(now); store.set(ip, list);
   return 0;
 }
 function dailyLimited() {
@@ -84,9 +92,18 @@ function dailyLimited() {
   daily.count++;
   return false;
 }
+function chatDailyLimited() {
+  const day = new Date().toISOString().slice(0, 10);
+  if (chatDaily.day !== day) chatDaily = { day, count: 0 };
+  if (chatDaily.count >= CHAT_DAILY_MAX) return true;
+  chatDaily.count++;
+  return false;
+}
 setInterval(() => {   // 메모리 정리
   const now = Date.now();
-  for (const [ip, list] of hits) if (!list.some((t) => now - t < RATE_WINDOW_MS)) hits.delete(ip);
+  for (const store of [hits, chatHits]) {
+    for (const [ip, list] of store) if (!list.some((t) => now - t < RATE_WINDOW_MS)) store.delete(ip);
+  }
   for (const [ip, f] of authFails) if (f.until && now > f.until) authFails.delete(ip);
 }, 5 * 60 * 1000).unref();
 
@@ -167,6 +184,10 @@ const server = http.createServer(async (req, res) => {
     return handleFactCheck(req, res);
   }
 
+  if (url.pathname === "/api/chat" && req.method === "POST") {
+    return handleChat(req, res);
+  }
+
   send(res, 404, "text/plain; charset=utf-8", "Not found");
 });
 
@@ -196,14 +217,8 @@ async function handleFactCheck(req, res) {
       hint: `.env 파일에 ${missing.join(", ")} 값을 넣고 서버를 다시 시작해 주세요. (README 참고)`,
     });
   }
-  if (running >= MAX_RUNNING) {
-    return sendJson(res, 429, { error: "다른 팩트체크가 진행 중입니다.", hint: "잠시 후 다시 실행해 주세요." });
-  }
-  if (HOSTED) {   // 호스팅에서만 횟수 제한 적용 (내 컴퓨터에서는 제한 없음)
-    const wait = rateLimited(clientIp(req));
-    if (wait) return sendJson(res, 429, { error: "요청이 너무 잦습니다.", hint: `약 ${Math.ceil(wait / 60)}분 뒤에 다시 시도해 주세요. (10분에 ${RATE_MAX_PER_IP}건까지)` });
-    if (dailyLimited()) return sendJson(res, 429, { error: "오늘 사용 한도에 도달했습니다.", hint: "내일 다시 시도해 주세요." });
-  }
+  const blocked = factCheckBlocked(req);
+  if (blocked) return sendJson(res, 429, blocked);
 
   // 진행 상황을 한 줄씩 보내는 방식 (NDJSON)
   running++;
@@ -224,8 +239,86 @@ async function handleFactCheck(req, res) {
   }
 }
 
+// 팩트체크 1건을 실행해도 되는지 확인 (화면 버튼과 챗봇이 같은 제한을 함께 씁니다)
+function factCheckBlocked(req) {
+  if (running >= MAX_RUNNING) return { error: "다른 팩트체크가 진행 중입니다.", hint: "잠시 후 다시 실행해 주세요." };
+  if (HOSTED) {   // 호스팅에서만 횟수 제한 적용 (내 컴퓨터에서는 제한 없음)
+    const wait = rateLimited(clientIp(req));
+    if (wait) return { error: "요청이 너무 잦습니다.", hint: `약 ${Math.ceil(wait / 60)}분 뒤에 다시 시도해 주세요. (10분에 ${RATE_MAX_PER_IP}건까지)` };
+    if (dailyLimited()) return { error: "오늘 사용 한도에 도달했습니다.", hint: "내일 다시 시도해 주세요." };
+  }
+  return null;
+}
+
+// ---------------- 챗봇 ----------------
+async function handleChat(req, res) {
+  const origin = req.headers.origin;
+  if (origin && !ALLOWED_HOSTS.has(origin.replace(/^https?:\/\//, "").toLowerCase())) {
+    return sendJson(res, 403, { error: "허용되지 않은 접속입니다." });
+  }
+  if (!String(req.headers["content-type"] || "").includes("application/json")) {
+    return sendJson(res, 415, { error: "잘못된 요청 형식입니다." });
+  }
+
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 120_000));
+  } catch {
+    return sendJson(res, 400, { error: "요청을 읽지 못했습니다." });
+  }
+  if (!body || typeof body !== "object") return sendJson(res, 400, { error: "요청을 읽지 못했습니다." });
+  const isCheck = body.action === "check";
+  const textIn = String((isCheck ? body.claim : body.message) || "").trim();
+  if (!textIn) return sendJson(res, 400, { error: "메시지를 입력해 주세요." });
+  const max = isCheck ? MAX_CLAIM : CHAT_LIMITS.maxMessage;
+  if (textIn.length > max) return sendJson(res, 400, { error: `${max}자 이내로 입력해 주세요.` });
+
+  const missing = [!KEYS.tavilyKey && "TAVILY_API_KEY", !KEYS.geminiKey && "GEMINI_API_KEY"].filter(Boolean);
+  if (missing.length) {
+    return sendJson(res, 500, {
+      error: "서버에 API 키가 설정되지 않았습니다.",
+      hint: `.env 파일에 ${missing.join(", ")} 값을 넣고 서버를 다시 시작해 주세요. (README 참고)`,
+    });
+  }
+  if (HOSTED) {
+    const wait = rateLimited(clientIp(req), chatHits, CHAT_MAX_PER_IP);
+    if (wait) return sendJson(res, 429, { error: "챗봇 요청이 너무 잦습니다.", hint: `약 ${Math.ceil(wait / 60)}분 뒤에 다시 시도해 주세요. (10분에 ${CHAT_MAX_PER_IP}건까지)` });
+    if (chatDailyLimited()) return sendJson(res, 429, { error: "오늘 챗봇 사용 한도에 도달했습니다.", hint: "내일 다시 시도해 주세요." });
+  }
+
+  res.writeHead(200, { ...SECURITY_HEADERS, "Content-Type": "application/x-ndjson; charset=utf-8" });
+  const write = (obj) => { if (!res.writableEnded) res.write(JSON.stringify(obj) + "\n"); };
+  const onProgress = (step) => write({ type: "progress", step });
+
+  // 챗봇이 실행하는 팩트체크도 화면 버튼과 똑같은 동시 실행·횟수 제한을 거칩니다
+  const runCheck = async (claim, scope, progress) => {
+    const blocked = factCheckBlocked(req);
+    if (blocked) throw Object.assign(new Error("limit"), { limit: blocked });
+    running++;
+    try {
+      return await runFactCheck(claim, KEYS, progress, { scope });
+    } finally {
+      running--;
+    }
+  };
+
+  const started = Date.now();
+  try {
+    const message = await handleChatTurn(body, KEYS, { onProgress, runCheck });
+    write({ type: "result", message });
+    log(`챗봇 완료 (${((Date.now() - started) / 1000).toFixed(1)}초) 종류=${message.kind}`);
+  } catch (err) {
+    const info = explainError(err);
+    log(`챗봇 오류: ${redact(err?.service || "")} ${err?.status || ""} ${redact(err?.detail || err?.message || String(err))}`);
+    write({ type: "error", ...info });
+  } finally {
+    res.end();
+  }
+}
+
 // 오류를 기자가 이해할 수 있는 말로 바꾸기 (키 등 내부 정보는 화면에 보내지 않음)
 function explainError(err) {
+  if (err?.limit) return err.limit;
   if (err instanceof ServiceError) {
     const who = err.service === "tavily" ? "Tavily(검색)" : "Gemini(AI)";
     if (err.friendly) return { error: err.friendly, hint: "주장을 다른 표현으로 바꿔 다시 시도해 주세요." };
