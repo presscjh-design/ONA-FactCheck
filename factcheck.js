@@ -78,6 +78,7 @@ export const REGIONAL_PRESS = {
     "phmbc.co.kr": "포항MBC", "newsmin.co.kr": "뉴스민", "pn.or.kr": "평화뉴스",
   },
 };
+const REGIONAL_NAMES = Object.assign({}, ...Object.values(REGIONAL_PRESS));
 
 export const PUBLISHER_NAMES = {
   "kostat.go.kr": "통계청", "mods.go.kr": "국가데이터처", "kosis.kr": "국가통계포털(KOSIS)",
@@ -118,6 +119,7 @@ export const PUBLISHER_NAMES = {
   "newsis.com": "뉴시스", "news1.kr": "뉴스1", "ohmynews.com": "오마이뉴스",
   "bbc.com": "BBC", "bbc.co.uk": "BBC", "reuters.com": "로이터", "apnews.com": "AP통신",
   "nytimes.com": "뉴욕타임스", "bloomberg.com": "블룸버그", "theguardian.com": "가디언",
+  ...REGIONAL_NAMES,
 };
 
 // Tavily '1차 자료 우선 검색'에 넘길 사이트 목록
@@ -837,6 +839,7 @@ function classifyTier(host) {
   if (PRIMARY_DOMAINS.some((d) => matchesDomain(host, d))) return "primary";
   if (PUBLIC_DOMAINS.some((d) => matchesDomain(host, d))) return "public";
   if (NEWS_DOMAINS.some((d) => matchesDomain(host, d))) return "news";
+  if (Object.keys(REGIONAL_NAMES).some((d) => matchesDomain(host, d))) return "news";   // 지역 언론도 언론 보도로 분류
   return "other";
 }
 function publisherOf(host) {
